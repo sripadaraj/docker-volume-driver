@@ -2,196 +2,128 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 
-	"github.com/sripadaraj/docker-volume-driver/rest"
+	"github.com/Sirupsen/logrus"
 	"github.com/docker/go-plugins-helpers/volume"
 )
 
-type volumeName struct {
-	name        string
-	connections int
-}
-
+// ExampleDriver is a initialsied with different arguments.
 type ExampleDriver struct {
-	root       string
-	restClient *rest.Client
-	servers    []string
-	volumes    map[string]*volumeName
+	volumes    map[string]string
 	m          *sync.Mutex
+	mountPoint string
 }
 
-func newExampleDriver(root, restAddress, gfsBase string, servers []string) ExampleDriver {
-	d := ExampleDriver{
-		root:    root,
-		servers: servers,
-		volumes: map[string]*volumeName{},
-		m:       &sync.Mutex{},
+// NewExampleDriver creates a plugin handler from an existing volume
+// driver. This could be used, for instance, by the `local` volume driver built-in
+// to Docker Engine and it would create a plugin from it that maps plugin API calls
+// directly to any volume driver that satisfies the volume.Driver interface from
+// Docker Engine.
+func NewExampleDriver() ExampleDriver {
+	return ExampleDriver{
+		volumes:    make(map[string]string),
+		m:          &sync.Mutex{},
+		mountPoint: "/tmp/mntdir1",
 	}
-	if len(restAddress) > 0 {
-		d.restClient = rest.NewClient(restAddress, gfsBase)
-	}
-	return d
 }
 
+// Create request results in API call to volume registry
+// that creates requested volume if possible.
 func (d ExampleDriver) Create(r volume.Request) volume.Response {
-	log.Printf("Creating volume %s\n", r.Name)
+	logrus.Infof("Create volume: %s", r.Name)
 	d.m.Lock()
 	defer d.m.Unlock()
-	m := d.mountpoint(r.Name)
-
-	if _, ok := d.volumes[m]; ok {
+	if _, ok := d.volumes[r.Name]; ok {
 		return volume.Response{}
 	}
 
-	if d.restClient != nil {
-		exist, err := d.restClient.VolumeExist(r.Name)
-		if err != nil {
-			return volume.Response{Err: err.Error()}
-		}
+	volumePath := filepath.Join(d.mountPoint, r.Name)
+	_, err := os.Lstat(volumePath)
 
-		if !exist {
-			if err := d.restClient.CreateVolume(r.Name, d.servers); err != nil {
-				return volume.Response{Err: err.Error()}
-			}
-		}
+	if err != nil {
+		fmt.Printf("Creating new directory %s", volumePath)
+		//cmd := exec.Command("sudo mkdir", "-p", volumePath)
+		os.Mkdir(volumePath, os.ModePerm)
 	}
+	d.volumes[r.Name] = volumePath
 	return volume.Response{}
 }
 
-func (d ExampleDriver) Remove(r volume.Request) volume.Response {
-	log.Printf("Removing volume %s\n", r.Name)
-	d.m.Lock()
-	defer d.m.Unlock()
-	m := d.mountpoint(r.Name)
-
-	if s, ok := d.volumes[m]; ok {
-		if s.connections <= 1 {
-			if d.restClient != nil {
-				if err := d.restClient.StopVolume(r.Name); err != nil {
-					return volume.Response{Err: err.Error()}
-				}
-			}
-			delete(d.volumes, m)
-		}
-	}
-	return volume.Response{}
-}
-
-func (d ExampleDriver) Path(r volume.Request) volume.Response {
-	return volume.Response{Mountpoint: d.mountpoint(r.Name)}
-}
-
-func (d ExampleDriver) Mount(r volume.Request) volume.Response {
-	d.m.Lock()
-	defer d.m.Unlock()
-	m := d.mountpoint(r.Name)
-	log.Printf("Mounting volume %s on %s\n", r.Name, m)
-
-	s, ok := d.volumes[m]
-	if ok && s.connections > 0 {
-		s.connections++
-		return volume.Response{Mountpoint: m}
-	}
-
-	fi, err := os.Lstat(m)
-
-	if os.IsNotExist(err) {
-		if err := os.MkdirAll(m, 0755); err != nil {
-			return volume.Response{Err: err.Error()}
-		}
-	} else if err != nil {
-		return volume.Response{Err: err.Error()}
-	}
-
-	if fi != nil && !fi.IsDir() {
-		return volume.Response{Err: fmt.Sprintf("%v already exist and it's not a directory", m)}
-	}
-
-	if err := d.mountVolume(r.Name, m); err != nil {
-		return volume.Response{Err: err.Error()}
-	}
-
-	d.volumes[m] = &volumeName{name: r.Name, connections: 1}
-
-	return volume.Response{Mountpoint: m}
-}
-
-func (d ExampleDriver) Unmount(r volume.Request) volume.Response {
-	d.m.Lock()
-	defer d.m.Unlock()
-	m := d.mountpoint(r.Name)
-	log.Printf("Unmounting volume %s from %s\n", r.Name, m)
-
-	if s, ok := d.volumes[m]; ok {
-		if s.connections == 1 {
-			if err := d.unmountVolume(m); err != nil {
-				return volume.Response{Err: err.Error()}
-			}
-		}
-		s.connections--
-	} else {
-		return volume.Response{Err: fmt.Sprintf("Unable to find volume mounted on %s", m)}
-	}
-
-	return volume.Response{}
-}
-
-func (d ExampleDriver) Get(r volume.Request) volume.Response {
-	d.m.Lock()
-	defer d.m.Unlock()
-	m := d.mountpoint(r.Name)
-	if s, ok := d.volumes[m]; ok {
-		return volume.Response{Volume: &volume.Volume{Name: s.name, Mountpoint: d.mountpoint(s.name)}}
-	}
-
-	return volume.Response{Err: fmt.Sprintf("Unable to find volume mounted on %s", m)}
-}
-
+// List all volumes and their respective mount points.
 func (d ExampleDriver) List(r volume.Request) volume.Response {
+	logrus.Info("Volumes list ", r)
+	volumes := []*volume.Volume{}
+	for name, path := range d.volumes {
+		volumes = append(volumes, &volume.Volume{
+			Name:       name,
+			Mountpoint: path,
+		})
+	}
+	return volume.Response{Volumes: volumes}
+}
+
+// Get request the information about specified volume
+// and returns the name, mountpoint & status.
+func (d ExampleDriver) Get(r volume.Request) volume.Response {
+	logrus.Info("Get volume ", r)
+	if path, ok := d.volumes[r.Name]; ok {
+		return volume.Response{
+			Volume: &volume.Volume{
+				Name:       r.Name,
+				Mountpoint: path,
+			},
+		}
+	}
+	return volume.Response{
+		Err: fmt.Sprintf("volume named %s not found", r.Name),
+	}
+}
+
+// Remove is called to delete a volume.
+func (d ExampleDriver) Remove(r volume.Request) volume.Response {
+	logrus.Info("Remove volume ", r)
 	d.m.Lock()
 	defer d.m.Unlock()
-	var vols []*volume.Volume
-	for _, v := range d.volumes {
-		vols = append(vols, &volume.Volume{Name: v.name, Mountpoint: d.mountpoint(v.name)})
+
+	if _, ok := d.volumes[r.Name]; ok {
+		delete(d.volumes, r.Name)
 	}
-	return volume.Response{Volumes: vols}
+	return volume.Response{}
 }
 
-func (d *ExampleDriver) mountpoint(name string) string {
-	return filepath.Join(d.root, name)
+// Path is called to get the path of a volume mounted on the host.
+func (d ExampleDriver) Path(r volume.Request) volume.Response {
+	logrus.Info("Get volume path", r)
+	if path, ok := d.volumes[r.Name]; ok {
+		return volume.Response{
+			Mountpoint: path,
+		}
+	}
+	return volume.Response{}
 }
 
-func (d *ExampleDriver) mountVolume(name, destination string) error {
-	var serverNodes []string
-	for _, server := range d.servers {
-		serverNodes = append(serverNodes, fmt.Sprintf("-s %s", server))
+// Mount bind the volume to a container specified by the Path.
+func (d ExampleDriver) Mount(r volume.MountRequest) volume.Response {
+	logrus.Info("Mount volume ", r)
+	if path, ok := d.volumes[r.Name]; ok {
+		return volume.Response{
+			Mountpoint: path,
+		}
 	}
-
-	cmd := fmt.Sprintf("volumedriver --volfile-id=%s %s %s", name, strings.Join(serverNodes[:], " "), destination)
-	if out, err := exec.Command("sh", "-c", cmd).CombinedOutput(); err != nil {
-		log.Println(string(out))
-		return err
-	}
-	return nil
+	return volume.Response{}
 }
 
-func (d *ExampleDriver) unmountVolume(target string) error {
-	cmd := fmt.Sprintf("umount %s", target)
-	if out, err := exec.Command("sh", "-c", cmd).CombinedOutput(); err != nil {
-		log.Println(string(out))
-		return err
-	}
-	return nil
+// Unmount is called to stop the container from using the volume
+// and it is probably safe to unmount.
+func (d ExampleDriver) Unmount(r volume.UnmountRequest) volume.Response {
+	logrus.Info("Unmount ", r)
+	return volume.Response{}
 }
 
+// Capabilities indicates if a volume has to be created multiple times or only once.
 func (d ExampleDriver) Capabilities(r volume.Request) volume.Response {
-    var res volume.Response
-    res.Capabilities = volume.Capability{Scope: "local"}
-    return res
+	return volume.Response{Capabilities: volume.Capability{Scope: "global"}}
 }
