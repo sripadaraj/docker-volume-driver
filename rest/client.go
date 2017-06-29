@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 )
-
+// the volume path will also be default when client never mention the path that has to be for the plugin 
 const (
 	volumePath 	 = "/tmp/mntdir1"
 	volumeCreatePath = "/tmp/mntdir1"
